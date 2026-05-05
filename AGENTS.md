@@ -417,3 +417,72 @@ dmesg | grep -i tty
 - 远程仓库 `origin/main` 原本已有 `README.md` 和 `AGENTS.md`；本次已用 `--allow-unrelated-histories` 合并远程历史，保留远程 `README.md`，`AGENTS.md` 冲突以本地追加后的项目记录为准。
 - 本次 `git push -u origin main` 卡在 GitHub HTTPS 认证：GitHub 返回 `401` 后调用 Windows `git credential-manager get`，禁用 credential helper 后确认错误为 `fatal: unable to get password from user`。后续需要用户在本机完成 GitHub 凭据授权后再推送。
 - 用户完成 GitHub 认证后，远程 `origin/main` 已成功更新到本地提交；已通过 `git ls-remote --heads origin main`、`git fetch origin main`、`git rev-parse HEAD` 和 `git rev-parse origin/main` 核对本地/远程提交一致。
+
+## 本次确认：Aurora 导出 dump 图像功能可用于 field_nav_demo 调试
+
+- Aurora 的 A1 图像工具可以用于本项目导出板端保存的 tensor 图像，但当前 `field_nav_demo` 源码还没有接入自动保存 dump 图像逻辑。
+- SDK 人脸 demo 中已经有参考实现：`smart_software\src\app_demo\face_detection\ssne_ai_demo\src\scrfd_gray.cpp` 会在推理后保存最后一帧 `ssne_tensor_t`，退出时调用 `save_tensor(...)` 写出调试图像。
+- `save_tensor(ssne_tensor_t tensor, const char* filepath)` 在 SDK 头文件 `output\opt\m1_sdk\usr\include\smartsoc\ssne_api.h` 中声明，会保存 tensor 及其元数据；Aurora 可以基于这些元数据读取宽高和格式。
+- 为了配合 Aurora 自动导出，调试文件名建议使用 `.bin` 后缀，例如 `field_nav_dbg_crop.bin`、`field_nav_dbg_model_input.bin`；截图里的说明强调 `.bin` 后缀更适合 Aurora 双击/自动导出流程。
+- 本项目最有价值的 dump 点：
+  - `ImageProcessor::GetImage()` 得到的 `image`：当前在线 pipeline 输出，约为 crop 后的 `720x540` 灰度图，可检查摄像头画面和 crop 是否正确。
+  - `NavLineDetector::Predict()` 中 `RunAiPreprocessPipe(...)` 后的 `input_`：模型实际输入，约为 `640x480` 灰度图，可检查 resize 后喂给 NPU 的图像。
+  - `output_` 是模型输出概率图，通常约 `120x160`，可作为原始 tensor 调试，但不一定适合直接当普通图片看；更适合结合日志或另写主机脚本解析概率。
+- 建议只在调试开关下保存 dump，不要每帧保存；A1 存储和串口导出都慢，连续保存会影响 `FPS_app` 和板端实时性。
+- 接入前的 `field_nav_demo` 只处理 `SIGINT/SIGTERM` 和 `FIELD_NAV_TEST_SECONDS`，没有像截图 demo 那样监听串口输入 `q` 退出；如果不重新构建包含本次改动的新镜像，板端旧程序仍然不会响应 `q`。
+- 接入后仍需在 Linux SDK 容器中重新执行 `field_nav_external\scripts\build_field_nav.sh`，确保 `field_nav_demo-dirclean` 生效并重新生成烧录镜像；Windows PowerShell 不能证明 Buildroot 编译通过。
+- 接入前的 `main.cpp` 没有 `getchar`、`fgets`、`std::cin`、`select` 或 `poll` 等标准输入监听逻辑；在 Aurora 串口窗口输入 `q` 回车不会因此退出，也不会触发 dump 保存。
+- 旧程序可用的退出/停止方式是 `SIGINT/SIGTERM`、进程被系统停止，或通过 `FIELD_NAV_TEST_SECONDS` 传入固定运行秒数自动退出。支持 `q` 回车后仍需重新构建烧录镜像才会在板端生效。
+- 已按“不改头文件”的约束实现 `q/Q` 回车退出：`main.cpp` 使用 `isatty(STDIN_FILENO)` 判断是否有交互 stdin，使用 `select()` 零超时轮询，再用 `read()` 读取输入字符，收到 `q` 或 `Q` 后优雅退出。
+- 收到 `q/Q` 时，当前实现只保存本帧 `ImageProcessor::GetImage()` 得到的 crop tensor，不保存 `NavLineDetector::input_` 或 `output_`，因为这两个 tensor 是私有成员，保存它们需要改 `field_nav.hpp` 增加 debug 接口。
+- 退出 dump 默认保存到板端 `/field_nav/field_nav_dbg_crop.bin`，调用的是 SDK 的 `save_tensor(image, "/field_nav/field_nav_dbg_crop.bin")`，保存后串口日志会打印路径、width、height、dtype 和返回码。
+- 如果程序由自启动脚本后台启动且 stdin 不是 TTY，启动日志会打印 `stdin is not interactive`，这种情况下 Aurora 串口输入 `q` 不会作用到该进程；需要前台运行 `/field_nav/scripts/run.sh` 才能使用 `q` 回车退出。
+
+## 本次执行：核心逻辑中文注释补充
+
+- 本次只补充中文注释和函数说明，没有修改算法逻辑、运行参数、协议字段、模型文件或数据集文件。
+- 本次没有修改 `.h/.hpp`，尤其没有修改 `field_nav_external\src\field_nav_demo\include\field_nav.hpp`。
+- 当前根目录 `D:\1.1.1.1.1` 已经是 Git 仓库；本轮检查 `git status --short` 时，进入任务前 `AGENTS.md` 已存在未提交修改。
+- 板端注释范围覆盖 `image_processor.cpp`、`main.cpp`、`navline_detector.cpp`、`osd_overlay.cpp`，重点说明摄像头裁剪、NPU 推理、TDM-LS 后处理、OSD、UART 16 字节导航帧和 60 秒 metrics。
+- RDK/构建注释范围覆盖 `rdk_x5_nav_bridge.py`、`run.sh`、`build_field_nav.sh`、`smartsoc_start.sh`、`field_nav_demo.mk`、`CMakeLists.txt`，重点说明串口帧解析、停车兜底、Buildroot dirclean 和 LUT/模型打包路径。
+- 训练工具注释范围覆盖 `field_nav_workspace\tools` 下的数据准备、审计、训练、评估、ONNX 对比和 host proof 脚本。
+- 注释原则：函数级说明输入输出和使用注意，关键变量就地解释含义，关键算法循环前说明实现原理；避免把注释写进头文件或改动可执行逻辑。
+
+## 本次确认：项目鲁棒性体现方式
+
+- 本项目的鲁棒性不能只用“能跑起来”体现，应同时从算法容错、运行稳定、通信安全和现场证据四个层面证明。
+- 算法层面重点看 `navline_detector.cpp`：模型输出后先按阈值 `0.45` 得到 road mask，再做纵向形态学修补、连通域过滤、主贯通域选择、行带中心点提取和最小二乘拟合；成功日志为 `reason=ok_tdm_ls`。
+- 短时遮挡或模型输出断裂时，`navline_detector.cpp` 最多 2 帧使用上一帧有效导航线低置信度兜底，日志为 `reason=fallback_last_valid`；连续失败后应输出 `valid=0`，不能长期假装有效。
+- 后处理诊断字段 `components`、`main_area`、`band_points`、`points`、`fallback`、`valid`、`failure` 是判断鲁棒性的直接依据。强鲁棒性表现为这些字段在光照变化、道路纹理变化、短时遮挡下仍能稳定回到 `ok_tdm_ls`，且不会频繁长时间 `valid=0`。
+- 运行层面重点看 `main.cpp` 的 60 秒 metrics：`valid_nav`、`no_line`、`predict_fail`、`image_fail`、`uart_sent`、`uart_fail`、`max_invalid_ms`、`P95_frame_ms`、`max_frame_ms`、`image_ms`、`predict_ms`、`uart_ms`、`osd_ms`。
+- `max_invalid_ms` 是鲁棒性核心扣分指标。普通光照、强光/开窗、暗光/关灯至少各跑 60 秒，若连续无效导航超过 `1000ms`，要如实记录并继续优化模型、阈值、crop 或后处理。
+- 性能鲁棒性要看 `FPS_app`、`fps_ratio` 和各阶段 P95/max 耗时。`FIELD_NAV_SENSOR_FPS=90` 只代表日志目标值，不能代替真实 90fps 证明；如果 `image_ms` P95 接近 33ms，说明摄像头/ISP 链路仍接近 30fps。
+- OSD 可能影响实时性，鲁棒性验证应分别跑 `FIELD_NAV_OSD_RATE=15` 的正常显示测试和 `FIELD_NAV_OSD_RATE=0` 的无 OSD 性能复测。
+- 通信层面重点看 A1 `NavUartPublisher` 和 RDK `rdk_x5_nav_bridge.py`：A1 发送 `A5 5A` 16 字节导航帧，RDK 校验后输出 `B5 5B` 控制帧；`uart_sent` 应持续增长，`uart_fail` 应接近 0。
+- 安全兜底也属于鲁棒性：RDK 端要求 A1 导航帧 `valid`、`status==0`、置信度达到阈值且未超时；无有效导航、低置信度或超时时输出停车/禁用控制帧。
+- 当前主机端证据只能说明链路可运行：`host_proof` test 样本 32 个，`valid_navline_samples=32`，但 `mean_iou` 约 `0.499`、线误差仍偏大，不能把它等同于现场鲁棒性通过。
+- 当前项目仍缺少 Aurora 板端 60 秒实跑日志，不能证明 UART 实际发出、RDK 实际收到、下位机实际受控，也不能证明 90fps 达标。
+- 建议最终鲁棒性材料包括：三种光照各 60 秒 Aurora 串口日志、摄像头画面/OSD 录像、RDK 端接收日志、下位机停车超时验证、`FIELD_NAV_OSD_RATE=0` 性能复测日志、典型失败帧的 dump 图像或截图。
+
+## 本次确认：后处理提取中心线、偏移和角度算法
+
+- 本次回答已重新检查 `field_nav_external\src\field_nav_demo\src\navline_detector.cpp`，后处理实际入口仍是 `NavLineDetector::DecodeOutputToLine(...)`。
+- 后处理不是直接从 LabelMe polygon 或模型输出中取“导航线”，而是先把模型输出概率图转成 road mask，再从 road mask 中提取中心线。
+- 概率归一化：`FLOAT32` 输出按概率或 logit 处理，logit 走 `sigmoid`；`INT8` 按 `[-128,127]` 平移到 `[0,255]` 后归一化；`UINT8` 按 `[0,255]` 归一化。
+- 阈值分割：使用固定阈值 `kMaskThreshold=0.45`，把 road 概率图二值化为前景 mask。
+- ROI 限制：只处理模型输出图下方约 `65%` 区域，也就是从 `height * 0.35` 开始向下处理，减少远处小目标和噪声对近端控制的影响。
+- 纵向形态学闭运算：先纵向膨胀再纵向腐蚀，半径 `kMorphVerticalRadius=3`、横向半径 `0`，用于修补田垄道路 mask 的短断裂，同时避免横向错误粘连相邻垄沟。
+- 原始前景保留：闭运算后会把原始 mask 中的前景强制保留，避免细道路区域在腐蚀阶段被抹掉。
+- 连通域标记：使用 `4` 邻域 DFS 对二值 mask 做连通域标记。
+- 小连通域过滤：面积小于 `kMinComponentArea=30` 的连通域视为噪声丢弃。
+- 主道路区域选择：对候选连通域打分，偏好触底、纵向跨度大、面积大、贯通 ROI 或接近 ROI 顶部、接近上一帧预测位置或图像中心的区域。
+- 历史线预测辅助：如果已有上一帧有效导航线，会用上一帧 `slope/intercept` 预测当前 mask 行的期望 x 位置；没有历史线时使用图像中心作为参考。
+- 行带中心点提取：从近端向远端按 `kBandHeight=4` 个 mask 像素为一组扫描水平行带，每个行带在主连通域内计算一个概率加权中心点。
+- 坐标映射：行带中心点先在低分辨率输出 mask 坐标中计算，再映射回原始 `720x1280` 坐标系，供 OSD 和 UART 统一使用。
+- 最小二乘直线拟合：对提取到的中心点拟合 `x = slope * y + intercept`，最少需要 `kMinValidPoints=6` 个点，点数不足或几何退化时判失败。
+- 偏移计算：拟合成功后，先计算原始图像底部交点 `bottom_x = slope * (kOriginalHeight - 1) + intercept`，再计算 `deviation_px = bottom_x - (kOriginalWidth / 2.0f)`。
+- 角度计算：使用 `angle_deg = atan(slope) * 180 / pi`，即根据拟合直线斜率换算航向角。
+- 置信度计算：中心线整体 `confidence` 使用各行带中心点置信度的平均值。
+- 有效性判断：拟合成功后设置 `valid=true`，成功日志 reason 为 `ok_tdm_ls`。
+- 失败兜底：如果当前帧后处理失败且最近有效线仍在允许窗口内，最多 `2` 帧沿用上一帧导航线，并把线和点的置信度减半，日志 reason 为 `fallback_last_valid`；超过窗口后输出无效线。
+- 当前实现未采用 DBSCAN、Hough、骨架化、完整 Otsu/YCrCb 颜色分割或 OpenCV 重型轮廓算法作为主流程。

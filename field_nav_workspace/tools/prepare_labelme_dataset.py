@@ -17,6 +17,11 @@ VALID_LABELS = {"sand_road", "grassy_road"}
 
 
 def parse_args() -> argparse.Namespace:
+    """解析数据准备命令行参数。
+
+    输入来自 CLI；输出 argparse.Namespace，包含原始数据集目录、输出尺寸、随机种子和 split 比例。
+    """
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset-root", required=True, type=Path)
     parser.add_argument(
@@ -34,16 +39,29 @@ def parse_args() -> argparse.Namespace:
 
 
 def find_labelme_dir(dataset_root: Path) -> Path:
+    """定位 LabelMe JSON 所在目录。
+
+    输入 dataset_root 可以是数据集根目录或 labelme_data 本身；输出实际读取 JSON/JPG 的目录。
+    """
+
     if (dataset_root / "labelme_data").is_dir():
         return dataset_root / "labelme_data"
     return dataset_root
 
 
 def polygon_points(points: Iterable[Iterable[float]]) -> list[tuple[float, float]]:
+    """把 LabelMe 点坐标转成 PIL polygon 可用的 float 二元组列表。"""
+
     return [(float(x), float(y)) for x, y in points]
 
 
 def render_mask(annotation: dict, image_size: tuple[int, int]) -> Image.Image:
+    """将 LabelMe polygon 标注渲染为二值道路 mask。
+
+    输入 annotation 和原图尺寸；输出 L 模式 mask，前景 255 表示可通行 road。
+    使用注意：sand_road/grassy_road 在此阶段合并为同一个前景类。
+    """
+
     mask = Image.new("L", image_size, 0)
     draw = ImageDraw.Draw(mask)
     for shape in annotation.get("shapes", []):
@@ -59,6 +77,11 @@ def render_mask(annotation: dict, image_size: tuple[int, int]) -> Image.Image:
 
 
 def make_preview(gray: Image.Image, mask: Image.Image) -> Image.Image:
+    """生成绿色半透明预览图。
+
+    输入灰度图和 mask；输出 RGB 图，便于人工快速检查 polygon 转 mask 是否正确。
+    """
+
     rgb = gray.convert("RGB")
     overlay = Image.new("RGB", rgb.size, (0, 255, 0))
     alpha = mask.point(lambda p: 96 if p > 0 else 0)
@@ -67,10 +90,20 @@ def make_preview(gray: Image.Image, mask: Image.Image) -> Image.Image:
 
 
 def write_split(path: Path, names: list[str]) -> None:
+    """写入 split txt 文件。
+
+    输入 path 和样本名列表；输出为一行一个样本名，末尾保留换行，兼容训练脚本读取。
+    """
+
     path.write_text("\n".join(names) + "\n", encoding="utf-8")
 
 
 def main() -> None:
+    """执行 v1 数据准备流程。
+
+    核心流程：读取 LabelMe JSON -> 渲染 mask -> 转灰度并缩放到模型尺寸 -> 随机划分 train/val/test。
+    """
+
     args = parse_args()
     if args.width < 1 or args.height < 1:
         raise SystemExit("--width and --height must be positive")
@@ -90,11 +123,12 @@ def main() -> None:
     if not json_files:
         raise SystemExit(f"no LabelMe json files found in {labelme_dir}")
 
-    records: list[dict] = []
-    labels_seen: dict[str, int] = {}
-    size_seen: dict[str, int] = {}
-    missing_images: list[str] = []
+    records: list[dict] = []  # 每个样本的来源、输出路径和原始尺寸记录。
+    labels_seen: dict[str, int] = {}  # 统计标签出现次数，用于发现非预期类别。
+    size_seen: dict[str, int] = {}  # 统计原始图片尺寸分布，便于判断数据集一致性。
+    missing_images: list[str] = []  # 找不到同名图片的 JSON 名称。
 
+    # 逐个样本读取标注、查找图片、生成灰度输入和二值 mask。
     for index, json_path in enumerate(json_files):
         annotation = json.loads(json_path.read_text(encoding="utf-8"))
         image_path = labelme_dir / annotation.get("imagePath", f"{json_path.stem}.jpg")
@@ -139,6 +173,7 @@ def main() -> None:
     if unexpected:
         raise SystemExit(f"unexpected labels found: {sorted(unexpected)}")
 
+    # 固定随机种子保证 split 可复现；排序后写文件便于 diff 和人工检查。
     rng = random.Random(args.seed)
     names = [record["name"] for record in records]
     rng.shuffle(names)

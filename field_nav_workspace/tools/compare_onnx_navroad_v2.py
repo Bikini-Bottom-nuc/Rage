@@ -16,6 +16,11 @@ from train_navroad_v2 import RoadDataset, SkipFusionNavRoadNet  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
+    """解析 PyTorch/ONNX 一致性比较参数。
+
+    输出数据目录、checkpoint、onnx 路径、split、抽样数量和运行设备。
+    """
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", required=True, type=Path)
     parser.add_argument("--checkpoint", required=True, type=Path)
@@ -27,6 +32,11 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    """比较 PyTorch checkpoint 与 ONNX 输出 logits。
+
+    核心用途是在交给 A1 转换前确认 ONNX 导出没有数值漂移；只比较 logits，不包含后处理。
+    """
+
     args = parse_args()
     if args.samples < 1:
         raise SystemExit("--samples must be >= 1")
@@ -48,10 +58,11 @@ def main() -> None:
 
     session = ort.InferenceSession(str(args.onnx), providers=["CPUExecutionProvider"])
     input_name = session.get_inputs()[0].name
-    diffs: list[float] = []
-    max_diffs: list[float] = []
+    diffs: list[float] = []  # 每个样本 mean(abs(torch_logits - onnx_logits))。
+    max_diffs: list[float] = []  # 每个样本 max(abs(diff))，用于发现局部异常。
 
     with torch.no_grad():
+        # 逐样本比较固定输入，避免 batch size 变化影响 ONNXRuntime 行为判断。
         for index in range(min(args.samples, len(dataset))):
             image, _ = dataset[index]
             torch_logits = model(image.unsqueeze(0).to(device)).cpu().numpy()

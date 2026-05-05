@@ -20,6 +20,11 @@ IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".bmp")
 
 
 def parse_args() -> argparse.Namespace:
+    """解析数据审计参数。
+
+    输出包含审计目录、人工修订副本目录和各类可疑样本阈值。
+    """
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset-root", required=True, type=Path)
     parser.add_argument(
@@ -46,12 +51,19 @@ def parse_args() -> argparse.Namespace:
 
 
 def find_labelme_dir(dataset_root: Path) -> Path:
+    """定位 LabelMe 标注目录；兼容传入数据集根目录或 labelme_data。"""
+
     if (dataset_root / "labelme_data").is_dir():
         return dataset_root / "labelme_data"
     return dataset_root
 
 
 def resolve_image_path(labelme_dir: Path, json_path: Path, annotation: dict) -> Path | None:
+    """根据 imagePath 和同名图片规则查找标注对应图像。
+
+    找到则返回 Path，找不到返回 None，供审计报告记录 missing_image。
+    """
+
     image_name = annotation.get("imagePath")
     candidates: list[Path] = []
     if image_name:
@@ -66,6 +78,8 @@ def resolve_image_path(labelme_dir: Path, json_path: Path, annotation: dict) -> 
 
 
 def polygon_points(points: Iterable[Iterable[float]]) -> list[tuple[float, float]]:
+    """把 LabelMe 点数组转为 float 坐标，并忽略维度不足的坏点。"""
+
     parsed: list[tuple[float, float]] = []
     for point in points:
         if len(point) >= 2:
@@ -74,6 +88,11 @@ def polygon_points(points: Iterable[Iterable[float]]) -> list[tuple[float, float
 
 
 def render_mask(annotation: dict, image_size: tuple[int, int]) -> Image.Image:
+    """渲染审计用二值 mask。
+
+    输入 annotation/image_size；输出 road mask。审计阶段跳过未知标签和非 polygon，问题另行计数。
+    """
+
     mask = Image.new("L", image_size, 0)
     draw = ImageDraw.Draw(mask)
     for shape in annotation.get("shapes", []):
@@ -88,6 +107,11 @@ def render_mask(annotation: dict, image_size: tuple[int, int]) -> Image.Image:
 
 
 def component_count(mask: Image.Image, max_dim: int = 320) -> int:
+    """估算 mask 连通域数量。
+
+    输入 mask；输出 4 邻域前景连通域个数。大图会先缩小到 max_dim 内，降低审计耗时。
+    """
+
     width, height = mask.size
     scale = min(1.0, max_dim / max(width, height))
     if scale < 1.0:
@@ -96,6 +120,7 @@ def component_count(mask: Image.Image, max_dim: int = 320) -> int:
     visited = np.zeros(arr.shape, dtype=bool)
     h, w = arr.shape
     count = 0
+    # 用栈式 DFS 避免递归深度问题；只需数量，不保留每个连通域的像素。
     for y in range(h):
         for x in range(w):
             if not arr[y, x] or visited[y, x]:
@@ -113,6 +138,11 @@ def component_count(mask: Image.Image, max_dim: int = 320) -> int:
 
 
 def overlay_preview(image: Image.Image, mask: Image.Image, record: dict, size: tuple[int, int]) -> Image.Image:
+    """生成带审计原因文字的叠加预览图。
+
+    输入原图/mask/审计记录/输出尺寸；输出 RGB 预览，用于人工快速复核 suspicious 样本。
+    """
+
     rgb = image.convert("RGB").resize(size, Image.BILINEAR)
     mask_small = mask.resize(size, Image.NEAREST)
     green = Image.new("RGB", size, (0, 255, 80))
@@ -127,6 +157,11 @@ def overlay_preview(image: Image.Image, mask: Image.Image, record: dict, size: t
 
 
 def classify_reasons(record: dict, args: argparse.Namespace) -> list[str]:
+    """根据审计记录和阈值生成可疑原因列表。
+
+    输出原因字符串列表；空列表表示该样本未触发当前规则。
+    """
+
     reasons: list[str] = []
     if record["missing_image"]:
         reasons.append("missing_image")
@@ -157,6 +192,11 @@ def classify_reasons(record: dict, args: argparse.Namespace) -> list[str]:
 
 
 def main() -> None:
+    """执行 LabelMe v2 数据审计。
+
+    核心流程：逐 JSON 统计标签/尺寸/mask 质量 -> 生成 overlay -> 可选复制可疑样本到 curated_dir。
+    """
+
     args = parse_args()
     if args.preview_width < 1 or args.preview_height < 1:
         raise SystemExit("--preview-width and --preview-height must be positive")
@@ -170,8 +210,9 @@ def main() -> None:
     if not json_files:
         raise SystemExit(f"no LabelMe json files found in {labelme_dir}")
 
-    rows: list[dict] = []
-    copied: list[dict] = []
+    rows: list[dict] = []  # audit.csv 的逐样本记录。
+    copied: list[dict] = []  # 已复制到 curated_v2 的可疑样本清单。
+    # 逐个 JSON 做静态审计，不修改原始数据；可疑样本只复制副本供人工修订。
     for json_path in json_files:
         annotation = json.loads(json_path.read_text(encoding="utf-8"))
         image_path = resolve_image_path(labelme_dir, json_path, annotation)

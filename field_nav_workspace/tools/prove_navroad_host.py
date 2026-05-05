@@ -26,6 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from train_navroad_v2 import RoadDataset, SkipFusionNavRoadNet  # noqa: E402
 
 
+# 以下常量镜像板端 field_nav.hpp 坐标约定，用于把 host 端结果映射到 720x1280 原始画面。
 K_ORIGINAL_WIDTH = 720
 K_ORIGINAL_HEIGHT = 1280
 K_CROP_WIDTH = 720
@@ -37,6 +38,11 @@ K_MODEL_HEIGHT = 480
 
 @dataclass
 class NavPoint:
+    """导航线中心点。
+
+    x/y 为原始画面坐标，confidence 为该行/段的平均置信度。
+    """
+
     x: float
     y: float
     confidence: float
@@ -44,6 +50,11 @@ class NavPoint:
 
 @dataclass
 class NavLine:
+    """host 端导航线结果。
+
+    字段含义与板端 NavLine 对齐，并额外保存 crop_bottom_x/crop_deviation_px 便于证明图统计。
+    """
+
     valid: bool = False
     slope: float = 0.0
     intercept: float = 0.0
@@ -57,6 +68,11 @@ class NavLine:
 
 
 def parse_args() -> argparse.Namespace:
+    """解析主机端证明参数。
+
+    输出数据目录、checkpoint、split、阈值、样本数量和可视化输出目录。
+    """
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", required=True, type=Path)
     parser.add_argument("--checkpoint", required=True, type=Path)
@@ -74,6 +90,11 @@ def parse_args() -> argparse.Namespace:
 
 
 def load_model(checkpoint_path: Path, device: torch.device) -> SkipFusionNavRoadNet:
+    """加载 v2 checkpoint。
+
+    输入 checkpoint 路径和 torch 设备；输出 eval 模式模型。兼容新旧 torch.load 参数。
+    """
+
     try:
         checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     except TypeError:
@@ -86,23 +107,37 @@ def load_model(checkpoint_path: Path, device: torch.device) -> SkipFusionNavRoad
 
 
 def resize_nearest(mask: np.ndarray, size: tuple[int, int]) -> np.ndarray:
+    """用最近邻把二值 mask 缩放到指定宽高。
+
+    输入 mask 和 (width,height)；输出 0/1 float32 mask，保持类别边界不被插值污染。
+    """
+
     width, height = size
     pil = Image.fromarray((mask.astype(np.float32) * 255.0).clip(0, 255).astype(np.uint8), mode="L")
     return (np.asarray(pil.resize((width, height), resample=Image.Resampling.NEAREST)) > 127).astype(np.float32)
 
 
 def original_to_display(x: float, y: float) -> tuple[float, float]:
+    """原始 720x1280 坐标转证明图 640x480 显示坐标。"""
+
     display_x = x * K_MODEL_WIDTH / K_CROP_WIDTH
     display_y = (y - K_CROP_OFFSET_Y) * K_MODEL_HEIGHT / K_CROP_HEIGHT
     return display_x, display_y
 
 
 def display_to_original_y(display_y: float) -> float:
+    """证明图 y 坐标转回原始画面 y，用于按板端坐标系绘制拟合线。"""
+
     return K_CROP_OFFSET_Y + display_y * K_CROP_HEIGHT / K_MODEL_HEIGHT
 
 
 def extract_navline(prob: np.ndarray, threshold: float) -> NavLine:
-    """Mirror field_nav_demo/src/navline_detector.cpp ExtractLine()."""
+    """从低分辨率概率图提取导航线。
+
+    输入 prob 为模型低分辨率 road 概率图，threshold 为二值化阈值；输出 NavLine。
+    实现镜像板端早期行扫描逻辑：逐行找连续前景段 -> 概率加权中心 -> 最小二乘拟合。
+    """
+
     line = NavLine()
     height, width = prob.shape
     if width <= 0 or height <= 0:
@@ -112,6 +147,7 @@ def extract_navline(prob: np.ndarray, threshold: float) -> NavLine:
     min_span = max(2, width // 40)
     y_stop = int(height * 0.35)
 
+    # 自底向上扫描近端区域；近端对车体控制最关键，远端噪声不参与拟合。
     for y in range(height - 1, y_stop - 1, -row_step):
         best_start = -1
         best_end = -1
@@ -119,6 +155,7 @@ def extract_navline(prob: np.ndarray, threshold: float) -> NavLine:
         start = -1
         running_sum = 0.0
 
+        # 单行内寻找概率和最高且宽度足够的连续前景段。
         for x in range(width):
             value = float(prob[y, x])
             if value >= threshold:
@@ -138,6 +175,7 @@ def extract_navline(prob: np.ndarray, threshold: float) -> NavLine:
                 start = -1
 
         if best_start >= 0:
+            # 对最佳段内像素按概率加权，得到更平滑的中心点。
             weighted_x = 0.0
             weight = 0.0
             for x in range(best_start, best_end + 1):
@@ -153,6 +191,7 @@ def extract_navline(prob: np.ndarray, threshold: float) -> NavLine:
     if len(line.points) < 6:
         return line
 
+    # 用 x = slope*y + intercept 做最小二乘拟合，和板端 UART/OSD 坐标定义保持一致。
     sum_y = sum(point.y for point in line.points)
     sum_x = sum(point.x for point in line.points)
     sum_yy = sum(point.y * point.y for point in line.points)
@@ -177,6 +216,11 @@ def extract_navline(prob: np.ndarray, threshold: float) -> NavLine:
 
 
 def line_errors(pred: NavLine, target: NavLine) -> tuple[float | None, float | None]:
+    """计算预测线与目标线误差。
+
+    输出 20 个近端采样点平均误差和 crop 底部误差；任一线无效则返回 None。
+    """
+
     if not pred.valid or not target.valid:
         return None, None
     y0 = K_CROP_OFFSET_Y + int(K_CROP_HEIGHT * 0.35)
@@ -191,6 +235,8 @@ def line_errors(pred: NavLine, target: NavLine) -> tuple[float | None, float | N
 
 
 def sample_iou(pred: np.ndarray, target: np.ndarray) -> float:
+    """计算单样本二值 mask IoU；目标和预测都为空时返回 1.0。"""
+
     inter = np.logical_and(pred, target).sum()
     union = np.logical_or(pred, target).sum()
     if union == 0:
@@ -199,6 +245,11 @@ def sample_iou(pred: np.ndarray, target: np.ndarray) -> float:
 
 
 def draw_line(draw: ImageDraw.ImageDraw, line: NavLine, color: tuple[int, int, int], width: int) -> None:
+    """在证明图上绘制导航线和中心点。
+
+    输入 PIL draw、NavLine、颜色和线宽；无效线直接跳过。
+    """
+
     if not line.valid:
         return
     points: list[tuple[float, float]] = []
@@ -226,6 +277,12 @@ def make_overlay(
     line_error: float | None,
     out_path: Path,
 ) -> None:
+    """生成单样本证明图。
+
+    输入图像、预测/目标 mask、预测/目标线和指标；输出叠加 jpg。
+    黄色为预测导航线，绿色为目标 mask 提取的参考线。
+    """
+
     base = (image.squeeze(0).numpy() * 255.0).clip(0, 255).astype(np.uint8)
     rgb = Image.fromarray(base, mode="L").convert("RGB")
     target_layer = Image.new("RGB", rgb.size, (20, 190, 60))
@@ -250,6 +307,11 @@ def make_overlay(
 
 
 def build_contact_sheet(image_paths: list[Path], output_path: Path, columns: int = 4, thumb_width: int = 320) -> None:
+    """把若干 overlay 合成联系表。
+
+    输入图片路径列表和输出路径；输出 contact_sheet.jpg，便于一次性查看多样本效果。
+    """
+
     if not image_paths:
         return
     thumbs: list[Image.Image] = []
@@ -271,6 +333,11 @@ def build_contact_sheet(image_paths: list[Path], output_path: Path, columns: int
 
 
 def main() -> None:
+    """执行主机端导航线证明流程。
+
+    流程：加载模型 -> 对 split 推理 -> 提取预测/目标导航线 -> 保存 overlay、mask、CSV 和汇总指标。
+    """
+
     args = parse_args()
     if args.threshold < 0.0 or args.threshold > 1.0:
         raise SystemExit("--threshold must be between 0 and 1")
@@ -289,15 +356,16 @@ def main() -> None:
 
     overlays_dir = args.output_dir / "overlays"
     masks_dir = args.output_dir / "pred_masks"
-    rows: list[dict[str, object]] = []
-    overlay_paths: list[Path] = []
-    ious: list[float] = []
-    line_error_values: list[float] = []
-    crop_bottom_error_values: list[float] = []
-    valid_count = 0
-    target_valid_count = 0
+    rows: list[dict[str, object]] = []  # proof_samples.csv 的逐样本记录。
+    overlay_paths: list[Path] = []  # 已生成 overlay 路径，用于 contact sheet。
+    ious: list[float] = []  # 每个样本的全尺寸 mask IoU。
+    line_error_values: list[float] = []  # 有效线样本的平均线误差。
+    crop_bottom_error_values: list[float] = []  # 有效线样本的 crop 底部误差。
+    valid_count = 0  # 预测线 valid 的样本数。
+    target_valid_count = 0  # 目标 mask 参考线 valid 的样本数。
 
     with torch.no_grad():
+        # 逐样本生成证明材料，保留每张图的 overlay 和 mask，便于赛前人工复核。
         for index in range(sample_count):
             name, image, mask = dataset[index]
             logits = model(image.unsqueeze(0).to(device))

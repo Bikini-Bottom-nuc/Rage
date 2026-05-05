@@ -15,6 +15,11 @@ from train_navroad import RoadDataset, TinyNavRoadNet
 
 
 def row_center(mask: np.ndarray, threshold: float = 0.5) -> list[tuple[int, float]]:
+    """从 mask 中按行提取道路中心点。
+
+    输入 HxW mask 和阈值；输出 (y, x_center) 列表，仅扫描下方 65% 近端区域。
+    """
+
     points: list[tuple[int, float]] = []
     h, w = mask.shape
     for y in range(h - 1, int(h * 0.35), -max(1, h // 32)):
@@ -25,6 +30,11 @@ def row_center(mask: np.ndarray, threshold: float = 0.5) -> list[tuple[int, floa
 
 
 def center_error(pred: np.ndarray, target: np.ndarray) -> float | None:
+    """计算预测/目标中心线平均横向误差。
+
+    输出单位为像素；共同有效扫描行少于 4 行时返回 None，表示无法稳定评估。
+    """
+
     pred_points = dict(row_center(pred))
     target_points = dict(row_center(target))
     common = sorted(set(pred_points) & set(target_points))
@@ -34,6 +44,8 @@ def center_error(pred: np.ndarray, target: np.ndarray) -> float | None:
 
 
 def parse_args() -> argparse.Namespace:
+    """解析 v1 checkpoint 评估参数，输出数据目录、权重、split 和设备。"""
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", required=True, type=Path)
     parser.add_argument("--checkpoint", required=True, type=Path)
@@ -43,6 +55,11 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    """执行 v1 模型评估。
+
+    流程：加载 checkpoint -> 对 split 推理 -> 计算 IoU 和中心线误差 -> 打印 JSON 指标。
+    """
+
     args = parse_args()
     device = torch.device(args.device)
     dataset = RoadDataset(args.data_dir, args.split, augment=False)
@@ -54,10 +71,11 @@ def main() -> None:
     model.load_state_dict(checkpoint["model"])
     model.eval()
 
-    ious: list[float] = []
-    errors: list[float] = []
-    invalid = 0
+    ious: list[float] = []  # 每个样本的 mask IoU。
+    errors: list[float] = []  # 可提取中心线样本的平均横向误差。
+    invalid = 0  # 无法提取有效中心线的样本数。
     with torch.no_grad():
+        # 逐样本推理，评估逻辑保持简单，避免 batch 维度掩盖单样本失败。
         for image, mask in dataset:
             image = image.unsqueeze(0).to(device)
             logits = model(image)

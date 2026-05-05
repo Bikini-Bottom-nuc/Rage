@@ -22,6 +22,11 @@ except ImportError as exc:  # pragma: no cover - runtime dependency guard
 
 
 def set_seed(seed: int) -> None:
+    """设置 Python/Numpy/PyTorch 随机种子。
+
+    输入 seed；输出为空。作用是让数据增强、初始化和训练 split 复现实验结果。
+    """
+
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -30,6 +35,11 @@ def set_seed(seed: int) -> None:
 
 
 class RoadDataset(Dataset):
+    """v2 道路分割数据集。
+
+    输入 data_dir/split/augment/return_name；输出灰度图张量、mask 张量，可选返回样本名。
+    """
+
     def __init__(self, data_dir: Path, split: str, augment: bool = False, return_name: bool = False) -> None:
         self.data_dir = data_dir
         self.names = [
@@ -41,9 +51,17 @@ class RoadDataset(Dataset):
         self.return_name = return_name
 
     def __len__(self) -> int:
+        """返回当前 split 样本数量。"""
+
         return len(self.names)
 
     def _augment(self, image: np.ndarray, mask: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """执行轻量图像增强。
+
+        输入 0~1 灰度 image 和二值 mask；输出增强后的 image/mask。
+        注意：增强只改变图像外观或水平翻转，不破坏 mask 与图像对应关系。
+        """
+
         if random.random() < 0.5:
             image = np.ascontiguousarray(image[:, ::-1])
             mask = np.ascontiguousarray(mask[:, ::-1])
@@ -61,6 +79,7 @@ class RoadDataset(Dataset):
             image = np.power(np.clip(image, 0.0, 1.0), gamma)
 
         if random.random() < 0.35:
+            # 模拟侧向阴影/开窗强光造成的横向亮度变化，提高现场鲁棒性。
             h, w = image.shape
             xs = np.linspace(0.0, 1.0, w, dtype=np.float32)
             center = random.uniform(0.0, 1.0)
@@ -80,6 +99,11 @@ class RoadDataset(Dataset):
         return image, mask
 
     def __getitem__(self, index: int):
+        """读取单个样本并转为 NCHW 前的 1xHxW 张量。
+
+        返回值根据 return_name 决定是否带样本名，供评估和失败预览定位文件。
+        """
+
         name = self.names[index]
         image = np.asarray(Image.open(self.data_dir / "images" / f"{name}.png").convert("L"), dtype=np.float32) / 255.0
         mask = np.asarray(Image.open(self.data_dir / "masks" / f"{name}.png").convert("L"), dtype=np.float32)
@@ -94,6 +118,8 @@ class RoadDataset(Dataset):
 
 
 class ConvBNAct(nn.Module):
+    """Conv2d + BatchNorm + ReLU 基础块，保持算子简单以兼容 A1 ONNX 转换。"""
+
     def __init__(self, in_channels: int, out_channels: int, stride: int = 1, dilation: int = 1) -> None:
         super().__init__()
         self.block = nn.Sequential(
@@ -111,10 +137,17 @@ class ConvBNAct(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """输入 NCHW 特征，输出卷积归一化激活后的特征。"""
+
         return self.block(x)
 
 
 class DepthwiseSeparable(nn.Module):
+    """深度可分离卷积块。
+
+    输入通道数 channels；输出通道数不变，用较低计算量扩大感受野。
+    """
+
     def __init__(self, channels: int, dilation: int = 1) -> None:
         super().__init__()
         self.block = nn.Sequential(
@@ -127,15 +160,19 @@ class DepthwiseSeparable(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """前向传播；输入输出 shape 保持一致。"""
+
         return self.block(x)
 
 
 def scaled_channels(base: int, width_mult: float) -> int:
+    """按 width_mult 缩放通道数，并保证最少 4 通道。"""
+
     return max(4, int(round(base * width_mult)))
 
 
 class SkipFusionNavRoadNet(nn.Module):
-    """Stride-4 segmentation net for 1x480x640 grayscale input."""
+    """带浅层跳连融合的 stride-4 灰度道路分割网络。"""
 
     def __init__(self, width_mult: float = 1.0) -> None:
         super().__init__()
@@ -152,6 +189,11 @@ class SkipFusionNavRoadNet(nn.Module):
         self.head = nn.Conv2d(cf, 1, 1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """输出低分辨率 road logits。
+
+        输入为 N,1,480,640；输出为 N,1,120,160。浅层/中层/上下文特征在 stride-4 尺度融合。
+        """
+
         stem = self.stem(x)
         down1 = self.down1(stem)
         down2 = self.down2(down1)
@@ -163,6 +205,8 @@ class SkipFusionNavRoadNet(nn.Module):
 
 
 def dice_loss(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """计算 Dice loss；输入 logits 和同尺寸 target，输出 batch 平均损失。"""
+
     prob = torch.sigmoid(logits)
     inter = (prob * target).sum(dim=(1, 2, 3))
     denom = prob.sum(dim=(1, 2, 3)) + target.sum(dim=(1, 2, 3))
@@ -170,6 +214,11 @@ def dice_loss(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
 
 
 def focal_bce_loss(logits: torch.Tensor, target: torch.Tensor, gamma: float = 2.0) -> torch.Tensor:
+    """计算带类别权重的 focal BCE。
+
+    输入 logits/target/gamma；输出平均损失，用于强调难分像素。
+    """
+
     bce = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
     prob = torch.sigmoid(logits)
     pt = prob * target + (1.0 - prob) * (1.0 - target)
@@ -178,12 +227,22 @@ def focal_bce_loss(logits: torch.Tensor, target: torch.Tensor, gamma: float = 2.
 
 
 def segmentation_loss(logits: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """组合分割损失。
+
+    输入模型低分辨率 logits 和原始 mask；输出 0.70*BCE + Dice + 0.40*FocalBCE。
+    """
+
     target = F.interpolate(mask, size=logits.shape[-2:], mode="nearest")
     bce = F.binary_cross_entropy_with_logits(logits, target)
     return 0.70 * bce + dice_loss(logits, target) + 0.40 * focal_bce_loss(logits, target)
 
 
 def row_centers(mask: np.ndarray, threshold: float = 0.5) -> dict[int, float]:
+    """按行扫描 mask 并取整行前景平均中心。
+
+    输入 HxW mask；输出 y -> x_center，用于训练期估算导航中心线误差。
+    """
+
     h, w = mask.shape
     step = max(1, h // 32)
     min_span = max(2, w // 40)
@@ -196,6 +255,11 @@ def row_centers(mask: np.ndarray, threshold: float = 0.5) -> dict[int, float]:
 
 
 def row_centers_best_segment(mask: np.ndarray, threshold: float = 0.5) -> dict[int, float]:
+    """按行选择最大连续前景段中心。
+
+    输入 HxW mask；输出 y -> segment_center，更接近板端后处理对主道路段的选择方式。
+    """
+
     h, w = mask.shape
     step = max(1, h // 32)
     min_span = max(2, w // 40)
@@ -207,6 +271,7 @@ def row_centers_best_segment(mask: np.ndarray, threshold: float = 0.5) -> dict[i
         best_sum = 0.0
         start = -1
         running_sum = 0.0
+        # 单行内寻找概率和最大的连续前景段，忽略小碎片。
         for x, value in enumerate(row):
             if value > threshold:
                 if start < 0:
@@ -228,6 +293,11 @@ def row_centers_best_segment(mask: np.ndarray, threshold: float = 0.5) -> dict[i
 
 
 def centerline_errors(pred: np.ndarray, target: np.ndarray, mode: str = "all") -> tuple[float | None, float | None]:
+    """计算预测 mask 和目标 mask 的中心线误差。
+
+    输出 mean_center_error 和 bottom_error；共同扫描行少于 4 行时返回 None，避免无意义指标。
+    """
+
     if mode == "best_segment":
         pred_points = row_centers_best_segment(pred)
         target_points = row_centers_best_segment(target)
@@ -243,6 +313,11 @@ def centerline_errors(pred: np.ndarray, target: np.ndarray, mode: str = "all") -
 
 
 def batch_metrics(logits: torch.Tensor, mask: torch.Tensor, threshold: float = 0.5) -> dict[str, float]:
+    """计算一个 batch 的 IoU 和中心线误差累积项。
+
+    输出为 sum/count 形式，便于 run_epoch 按样本数聚合。
+    """
+
     prob = torch.sigmoid(logits)
     prob_full = F.interpolate(prob, size=mask.shape[-2:], mode="bilinear", align_corners=False)
     pred = prob_full > threshold
@@ -255,6 +330,7 @@ def batch_metrics(logits: torch.Tensor, mask: torch.Tensor, threshold: float = 0
     invalid = 0
     pred_np = pred.squeeze(1).detach().cpu().numpy().astype(np.float32)
     target_np = target.squeeze(1).detach().cpu().numpy().astype(np.float32)
+    # 中心线误差在 CPU/Numpy 上计算，避免把评估后处理放进训练图。
     for pred_item, target_item in zip(pred_np, target_np):
         center_error, bottom_error = centerline_errors(pred_item, target_item)
         if center_error is None or bottom_error is None:
@@ -272,6 +348,11 @@ def batch_metrics(logits: torch.Tensor, mask: torch.Tensor, threshold: float = 0
 
 
 def run_epoch(model, loader, optimizer, device: torch.device) -> dict[str, float | None]:
+    """运行一个训练或验证 epoch。
+
+    optimizer 为 None 时不反向传播；返回 loss、IoU、中心线误差和 invalid 样本数。
+    """
+
     training = optimizer is not None
     model.train(training)
     total_loss = 0.0
@@ -310,6 +391,8 @@ def run_epoch(model, loader, optimizer, device: torch.device) -> dict[str, float
 
 
 def parse_args() -> argparse.Namespace:
+    """解析 v2 训练参数，包括早停、通道宽度倍率和优化器配置。"""
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", required=True, type=Path)
     parser.add_argument("--run-dir", default=Path("field_nav_workspace/runs/navroad_v2"), type=Path)
@@ -327,6 +410,11 @@ def parse_args() -> argparse.Namespace:
 
 
 def export_onnx(model: nn.Module, path: Path, device: torch.device) -> None:
+    """导出固定输入尺寸 ONNX。
+
+    输入模型/路径/设备；输出 navroad_640x480.onnx，后续交给 A1 AI Tool 转 .m1model。
+    """
+
     model.eval()
     dummy = torch.zeros(1, 1, 480, 640, device=device)
     torch.onnx.export(
@@ -342,6 +430,12 @@ def export_onnx(model: nn.Module, path: Path, device: torch.device) -> None:
 
 
 def is_better(row: dict, best_score: float, args: argparse.Namespace) -> tuple[bool, float]:
+    """判断当前 epoch 是否优于历史最佳。
+
+    输入一行训练日志和 best_score；输出是否提升及当前 score。
+    评分兼顾 val IoU 和中心线误差，避免只优化面积重叠而导航线偏差过大。
+    """
+
     val = row["val"]
     center_error = val["mean_center_error_px"] if val["mean_center_error_px"] is not None else 640.0
     score = float(val["iou"]) - 0.05 * (float(center_error) / 640.0)
@@ -349,6 +443,11 @@ def is_better(row: dict, best_score: float, args: argparse.Namespace) -> tuple[b
 
 
 def main() -> None:
+    """执行 v2 训练主流程。
+
+    流程：固定随机种子 -> 加载 split -> 训练 SkipFusionNavRoadNet -> 早停 -> 保存 best/last/ONNX/summary。
+    """
+
     args = parse_args()
     if args.epochs < 1:
         raise SystemExit("--epochs must be >= 1")
@@ -387,9 +486,9 @@ def main() -> None:
     model = SkipFusionNavRoadNet(width_mult=args.width_mult).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(args.epochs, 1))
-    best_score = -math.inf
-    bad_epochs = 0
-    history: list[dict] = []
+    best_score = -math.inf  # 复合选模分数，越高越好。
+    bad_epochs = 0  # 连续未提升 epoch 数，达到 patience 后早停。
+    history: list[dict] = []  # 每个 epoch 的完整指标，写入 history.json。
     config = {
         "width_mult": args.width_mult,
         "input_shape": [1, 480, 640],
@@ -397,6 +496,7 @@ def main() -> None:
         "loss": "0.70*bce + dice + 0.40*focal_bce",
     }
 
+    # 训练循环：每轮训练、验证、调学习率，并按复合分数保存 best.pt。
     for epoch in range(1, args.epochs + 1):
         train_metrics = run_epoch(model, train_loader, optimizer, device)
         val_metrics = run_epoch(model, val_loader, None, device)

@@ -21,12 +21,16 @@ import time
 from dataclasses import dataclass
 
 
+# A1 -> RDK 导航帧长度，必须与 main.cpp 的 packet[16] 保持一致。
 NAV_FRAME_LEN = 16
+# RDK -> 下位机控制帧长度，当前同样固定为 16 字节。
 CMD_FRAME_LEN = 16
+# A1 导航帧帧头：用于在串口字节流中重新同步帧边界。
 NAV_HEADER = b"\xA5\x5A"
+# 下位机控制帧帧头：便于下位机区分 RDK 控制命令。
 CMD_HEADER = b"\xB5\x5B"
 
-
+# Linux termios 波特率枚举映射；只允许表内值，避免传入平台不支持的波特率。
 BAUD_MAP = {
     9600: termios.B9600,
     19200: termios.B19200,
@@ -41,6 +45,12 @@ BAUD_MAP = {
 
 @dataclass
 class NavFrame:
+    """A1 导航帧的结构化结果。
+
+    字段来自 16 字节协议帧：seq 用于观察丢帧，valid/status/confidence 用于安全判定，
+    deviation_px/angle_deg/bottom_x_px 用于计算 RDK 输出给下位机的线速度和角速度。
+    """
+
     seq: int
     valid: bool
     deviation_px: float
@@ -53,14 +63,28 @@ class NavFrame:
 
 
 def checksum15(frame: bytes) -> int:
+    """计算协议校验和。
+
+    输入 frame 至少 15 字节；输出为前 15 字节累加后的低 8 位。
+    使用注意：A1 导航帧和 RDK 控制帧共用该校验规则。
+    """
+
     return sum(frame[:15]) & 0xFF
 
 
 def clamp(value: float, low: float, high: float) -> float:
+    """把 value 限制在 [low, high]，用于速度和协议 int16 字段防溢出。"""
+
     return max(low, min(high, value))
 
 
 def open_uart(path: str, baudrate: int) -> int:
+    """打开并配置 RDK 侧 UART。
+
+    输入 path 为 /dev/ttyS* 等设备，baudrate 为 BAUD_MAP 支持值。
+    输出为非阻塞 fd；异常表示设备不存在、权限不足或波特率不支持。
+    """
+
     if baudrate not in BAUD_MAP:
         raise ValueError(f"unsupported baudrate: {baudrate}")
 
@@ -82,6 +106,12 @@ def open_uart(path: str, baudrate: int) -> int:
 
 
 def parse_nav_frames(buffer: bytearray) -> list[NavFrame]:
+    """从串口接收缓冲区中解析完整 A1 导航帧。
+
+    输入 buffer 会被原地消费；输出为本次解析出的 NavFrame 列表。
+    实现原理：查找 A5 5A 帧头，长度够 16 字节后校验 checksum，坏帧直接丢弃并继续同步。
+    """
+
     frames: list[NavFrame] = []
     while True:
         start = buffer.find(NAV_HEADER)
@@ -126,6 +156,12 @@ def make_command_frame(
     deviation_px: float,
     mode: int,
 ) -> bytes:
+    """生成 RDK 发给下位机的 16 字节控制帧。
+
+    输入 seq/enable/valid_nav/速度/偏差/mode；输出 bytes。
+    使用注意：线速度单位为 mm/s，角速度单位为 mrad/s，偏差按 px*10 写入 int16。
+    """
+
     packet = bytearray(CMD_FRAME_LEN)
     packet[0:2] = CMD_HEADER
     packet[2] = 0x01
@@ -142,6 +178,12 @@ def make_command_frame(
 
 
 def compute_control(nav: NavFrame | None, args: argparse.Namespace) -> tuple[bool, bool, int, int, float, int]:
+    """把最近一帧 A1 导航数据转换为下位机速度命令。
+
+    输入 nav 可为空，args 提供阈值和比例参数；输出 enable/valid/linear/angular/deviation/mode。
+    安全策略：无帧、超时、低置信度或 A1 status 非 0 时全部输出停车。
+    """
+
     if nav is None:
         return False, False, 0, 0, 0.0, 2
 
@@ -150,6 +192,7 @@ def compute_control(nav: NavFrame | None, args: argparse.Namespace) -> tuple[boo
     if not valid_nav:
         return False, False, 0, 0, nav.deviation_px, 2
 
+    # 简单 P 控制：横向偏差和航向角共同决定角速度，下位机只执行 RDK 的最终控制帧。
     angular = args.kp_dev * nav.deviation_px + args.kp_ang * nav.angle_deg
     angular = int(clamp(round(angular), -args.max_angular, args.max_angular))
     linear = args.linear
@@ -159,6 +202,11 @@ def compute_control(nav: NavFrame | None, args: argparse.Namespace) -> tuple[boo
 
 
 def main() -> int:
+    """RDK 桥接主循环。
+
+    负责打开 UART、持续解析 A1 导航帧、按固定频率输出控制帧，并在退出时发送停车帧。
+    """
+
     parser = argparse.ArgumentParser(description="RDK X5 bridge: A1 nav UART -> lower controller command UART")
     parser.add_argument("--port", required=True, help="RDK 40Pin UART device, for example /dev/ttyS1")
     parser.add_argument("--baud", type=int, default=115200)
@@ -185,17 +233,18 @@ def main() -> int:
     fd = open_uart(args.port, args.baud)
     print(f"[rdk_nav] opened {args.port} baud={args.baud} rate={args.rate}Hz", flush=True)
 
-    rx_buffer = bytearray()
-    last_nav: NavFrame | None = None
-    next_send = time.monotonic()
-    interval = 1.0 / max(args.rate, 1.0)
-    cmd_seq = 0
-    last_report = time.monotonic()
+    rx_buffer = bytearray()  # 串口接收缓冲，parse_nav_frames 会原地消费完整帧。
+    last_nav: NavFrame | None = None  # 最近一帧有效格式的 A1 导航数据。
+    next_send = time.monotonic()  # 下一次发送下位机控制帧的时间点。
+    interval = 1.0 / max(args.rate, 1.0)  # RDK 输出控制帧周期，最低按 1Hz 防止除零。
+    cmd_seq = 0  # RDK 控制帧序号，16 位循环。
+    last_report = time.monotonic()  # 人类可读诊断日志的上次打印时间。
 
     try:
         while not stop:
             now = time.monotonic()
             timeout = max(0.0, min(0.02, next_send - now))
+            # select 控制阻塞时间：既及时读 A1 串口，也保证按 rate 周期发送控制帧。
             readable, _, _ = select.select([fd], [], [], timeout)
             if readable:
                 try:
@@ -209,6 +258,7 @@ def main() -> int:
 
             now = time.monotonic()
             if now >= next_send:
+                # 每个周期都发送控制帧；无有效导航时 compute_control 会返回停车命令。
                 enable, valid_nav, linear, angular, deviation, mode = compute_control(last_nav, args)
                 packet = make_command_frame(cmd_seq, enable, valid_nav, linear, angular, deviation, mode)
                 os.write(fd, packet)
@@ -233,6 +283,7 @@ def main() -> int:
                     )
                 last_report = now
     finally:
+        # 无论异常还是 Ctrl+C 退出，都尽量先发停车帧，降低下位机继续运动风险。
         stop_packet = make_command_frame(cmd_seq, False, False, 0, 0, 0.0, 0)
         try:
             os.write(fd, stop_packet)

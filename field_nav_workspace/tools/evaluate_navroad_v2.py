@@ -18,6 +18,11 @@ from train_navroad_v2 import RoadDataset, SkipFusionNavRoadNet, centerline_error
 
 
 def parse_args() -> argparse.Namespace:
+    """解析 v2 评估参数。
+
+    输出数据目录、checkpoint、split、阈值、失败样本预览目录和失败判定阈值。
+    """
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", required=True, type=Path)
     parser.add_argument("--checkpoint", required=True, type=Path)
@@ -37,6 +42,11 @@ def parse_args() -> argparse.Namespace:
 
 
 def load_model(checkpoint_path: Path, device: torch.device) -> SkipFusionNavRoadNet:
+    """加载 v2 checkpoint 并恢复模型结构。
+
+    输入 checkpoint 路径和设备；输出 eval 模式的 SkipFusionNavRoadNet。
+    """
+
     checkpoint = torch.load(checkpoint_path, map_location=device)
     config = checkpoint.get("config", {})
     model = SkipFusionNavRoadNet(width_mult=float(config.get("width_mult", 1.0))).to(device)
@@ -46,6 +56,8 @@ def load_model(checkpoint_path: Path, device: torch.device) -> SkipFusionNavRoad
 
 
 def sample_iou(pred: np.ndarray, target: np.ndarray) -> float:
+    """计算单样本二值 mask IoU；union 为 0 时按 1 防止除零。"""
+
     inter = np.logical_and(pred, target).sum()
     union = max(1, np.logical_or(pred, target).sum())
     return float(inter / union)
@@ -61,6 +73,11 @@ def make_failure_preview(
     center_error: float | None,
     bottom_error: float | None,
 ) -> None:
+    """生成失败样本可视化。
+
+    输入灰度图、预测 mask、目标 mask、指标和输出路径；输出带红/绿叠加和中心点标记的 jpg。
+    """
+
     base = (image.squeeze(0).numpy() * 255.0).clip(0, 255).astype(np.uint8)
     rgb = Image.fromarray(base, mode="L").convert("RGB")
     pred_layer = Image.new("RGB", rgb.size, (255, 40, 40))
@@ -71,6 +88,7 @@ def make_failure_preview(
     draw = ImageDraw.Draw(rgb)
     target_centers = row_centers(target.astype(np.float32))
     pred_centers = row_centers(pred.astype(np.float32))
+    # 绿色圆点为目标中心，红色方块为预测中心，便于定位偏移方向。
     for y, x in target_centers.items():
         draw.ellipse((x - 2, y - 2, x + 2, y + 2), fill=(0, 255, 0))
     for y, x in pred_centers.items():
@@ -86,6 +104,11 @@ def make_failure_preview(
 
 
 def main() -> None:
+    """执行 v2 模型评估并导出失败预览。
+
+    流程：推理 split -> 计算 IoU/中心线误差 -> 按阈值保存失败图 -> 写 metrics JSON。
+    """
+
     args = parse_args()
     if args.max_failures < 0:
         raise SystemExit("--max-failures must be >= 0")
@@ -99,16 +122,17 @@ def main() -> None:
 
     model = load_model(args.checkpoint, device)
     failure_dir = args.failure_dir / args.split
-    failure_count = 0
-    ious: list[float] = []
-    center_errors: list[float] = []
-    bottom_errors: list[float] = []
-    best_segment_center_errors: list[float] = []
-    best_segment_bottom_errors: list[float] = []
-    invalid = 0
-    invalid_best_segment = 0
+    failure_count = 0  # 已写出的失败预览数量，受 max_failures 限制。
+    ious: list[float] = []  # 所有样本 IoU。
+    center_errors: list[float] = []  # 常规中心线平均误差。
+    bottom_errors: list[float] = []  # 常规近端底部误差。
+    best_segment_center_errors: list[float] = []  # 最大连续段中心线平均误差。
+    best_segment_bottom_errors: list[float] = []  # 最大连续段近端底部误差。
+    invalid = 0  # 常规中心线无法评估的样本数。
+    invalid_best_segment = 0  # 最大连续段中心线无法评估的样本数。
 
     with torch.no_grad():
+        # 逐样本评估，保留 name 以便失败图片能回溯到原始样本。
         for name, image, mask in dataset:
             logits = model(image.unsqueeze(0).to(device))
             prob = torch.sigmoid(logits)
@@ -134,6 +158,7 @@ def main() -> None:
                 best_segment_center_errors.append(best_center_error)
                 best_segment_bottom_errors.append(best_bottom_error)
 
+            # 失败条件同时考虑 mask IoU 和导航中心线误差，更贴近实际控制需求。
             failed = (
                 iou < args.failure_iou
                 or center_error is None
