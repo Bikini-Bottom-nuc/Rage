@@ -416,3 +416,4 @@ dmesg | grep -i tty
 - 由于 `data\A1_SDK_SC132GS` 是嵌套 Git 仓库，根目录提交时不能直接 `git add .`；本次对 `field_nav_external` 使用 `git hash-object` + `git update-index --cacheinfo` 按普通文件写入根仓库索引，没有移动或删除嵌套 `.git`。
 - 远程仓库 `origin/main` 原本已有 `README.md` 和 `AGENTS.md`；本次已用 `--allow-unrelated-histories` 合并远程历史，保留远程 `README.md`，`AGENTS.md` 冲突以本地追加后的项目记录为准。
 - 本次 `git push -u origin main` 卡在 GitHub HTTPS 认证：GitHub 返回 `401` 后调用 Windows `git credential-manager get`，禁用 credential helper 后确认错误为 `fatal: unable to get password from user`。后续需要用户在本机完成 GitHub 凭据授权后再推送。
+- 用户完成 GitHub 认证后，远程 `origin/main` 已成功更新到本地提交；已通过 `git ls-remote --heads origin main`、`git fetch origin main`、`git rev-parse HEAD` 和 `git rev-parse origin/main` 核对本地/远程提交一致。
